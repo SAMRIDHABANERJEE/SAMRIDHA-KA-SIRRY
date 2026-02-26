@@ -925,8 +925,12 @@ function sendTextInput() {
 }
 
 // ============================================================
-// AI PROCESSING WITH WEB SEARCH VIA CLAUDE API
+// AI PROCESSING — uses OpenRouter (CORS-friendly, free tier available)
 // ============================================================
+
+// ⚙️ CONFIG: Get a FREE key at https://openrouter.ai (takes 30 seconds, no credit card)
+const OPENROUTER_KEY = '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'; // <-- paste your OpenRouter key here if you have one
+
 async function processQuery(query) {
   if (!query) return;
   addMessage('user', query);
@@ -934,60 +938,98 @@ async function processQuery(query) {
   setStatus('thinking', '✦ Thinking...', 'thinking');
   setOrbState('thinking');
 
-  // Check if query needs web search
+  // Web search via DuckDuckGo (no key needed)
   const needsSearch = detectNeedsSearch(query);
-
   let contextInfo = '';
-
   if (needsSearch) {
     document.getElementById('searchIndicator').classList.add('visible');
-    try {
-      contextInfo = await performWebSearch(query);
-    } catch (e) {
-      console.warn('Search failed:', e);
-    }
+    try { contextInfo = await performWebSearch(query); } catch(e) {}
     document.getElementById('searchIndicator').classList.remove('visible');
   }
 
-  // Build system prompt
-  const systemPrompt = `You are Sirry — Samridha's intelligent, warm, and witty AI voice assistant. You are helpful, concise, and conversational. 
-When speaking, keep responses natural and not too long (ideal for text-to-speech — under 100 words unless detail is needed). 
-Be friendly, engaging, and smart. If web search context is provided, use it accurately.
-Always respond in clear, spoken English.`;
+  const systemPrompt = `You are Sirry — Samridha's intelligent, warm, and witty AI voice assistant. Keep responses concise and conversational (ideal for voice — under 80 words). Be friendly and helpful. If web context is provided, use it. Respond in plain spoken English.`;
 
   const userMessage = contextInfo
-    ? `User question: "${query}"\n\nWeb search results for context:\n${contextInfo}\n\nPlease answer the question using this information.`
+    ? `Question: "${query}"\n\nWeb search info:\n${contextInfo}\n\nAnswer the question using this info.`
     : query;
 
   conversationHistory.push({ role: 'user', content: userMessage });
 
+  // Try multiple free endpoints in order
+  let answer = null;
+
+  // 1. Try OpenRouter (free models, CORS-enabled)
+  if (!answer) answer = await tryOpenRouter(systemPrompt);
+
+  // 2. Try Pollinations AI (completely free, no key)
+  if (!answer) answer = await tryPollinationsAI(userMessage, systemPrompt);
+
+  // 3. Smart built-in fallback
+  if (!answer) answer = generateSmartFallback(query, contextInfo);
+
+  conversationHistory.push({ role: 'assistant', content: answer });
+  removeThinking();
+  addMessage('ai', answer);
+  speak(answer);
+}
+
+async function tryOpenRouter(systemPrompt) {
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const msgs = conversationHistory.map(m => ({ role: m.role, content: m.content }));
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': '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', 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENROUTER_KEY}`,
+        'HTTP-Referer': 'https://samridha-sirry.app',
+        'X-Title': "Samridha's Sirry"
+      },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        system: systemPrompt,
-        messages: conversationHistory
+        model: 'mistralai/mistral-7b-instruct:free',
+        messages: [{ role: 'system', content: systemPrompt }, ...msgs],
+        max_tokens: 300
       })
     });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch(e) { return null; }
+}
 
-    const data = await response.json();
-    const answer = data.content?.map(b => b.text || '').join('') || "I'm sorry, I couldn't get a response right now.";
+async function tryPollinationsAI(userMessage, systemPrompt) {
+  try {
+    // Pollinations.ai text API — completely free, no key, CORS enabled
+    const prompt = encodeURIComponent(`${systemPrompt}\n\nUser: ${userMessage}\n\nSirry:`);
+    const res = await fetch(`https://text.pollinations.ai/${prompt}`, {
+      method: 'GET',
+      headers: { 'Accept': 'text/plain' }
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    return text?.trim() || null;
+  } catch(e) { return null; }
+}
 
-    conversationHistory.push({ role: 'assistant', content: answer });
-
-    removeThinking();
-    addMessage('ai', answer);
-    speak(answer);
-  } catch (err) {
-    removeThinking();
-    const fallback = "I'm having trouble connecting right now. Please check your internet connection and try again.";
-    addMessage('ai', fallback);
-    speak(fallback);
-    console.error(err);
+function generateSmartFallback(query, context) {
+  // If we got web search context, summarize it
+  if (context && context.length > 20) {
+    const lines = context.split('\n').filter(l => l.trim().length > 10);
+    if (lines.length > 0) {
+      const summary = lines[0].replace(/^(Summary:|Answer:|Definition:)\s*/i, '');
+      return `Based on what I found: ${summary.slice(0, 200)}`;
+    }
   }
+  // Keyword-based smart replies
+  const q = query.toLowerCase();
+  if (q.includes('hello') || q.includes('hi') || q.includes('hey')) return "Hello! I'm Sirry, Samridha's AI assistant. How can I help you today?";
+  if (q.includes('your name') || q.includes('who are you')) return "I'm Sirry — Samridha's personal AI voice assistant, here to help with questions, searches, and conversations!";
+  if (q.includes('time')) return `The current time is ${new Date().toLocaleTimeString()}.`;
+  if (q.includes('date') || q.includes('today')) return `Today is ${new Date().toLocaleDateString('en-US', {weekday:'long', year:'numeric', month:'long', day:'numeric'})}.`;
+  if (q.includes('weather')) return "I'd love to give you the weather, but I need internet access for live data. Please check a weather app for accurate forecasts!";
+  if (q.includes('joke')) return "Why don't scientists trust atoms? Because they make up everything! Hope that made you smile!";
+  if (q.includes('thank')) return "You're most welcome! Is there anything else I can help you with?";
+  if (q.includes('bye') || q.includes('goodbye')) return "Goodbye! Have a wonderful day. Come back anytime you need me!";
+  return `I heard your question about "${query}". I'm having trouble reaching the AI server right now, but I'm still here for you! Try asking me about the time, date, or something I can answer directly.`;
 }
 
 // ============================================================
@@ -1006,24 +1048,19 @@ function detectNeedsSearch(query) {
 
 async function performWebSearch(query) {
   try {
-    // Use DuckDuckGo Instant Answer API (no key needed, CORS allowed)
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url);
     const data = await res.json();
-
     let context = '';
     if (data.AbstractText) context += `Summary: ${data.AbstractText}\n`;
     if (data.Answer) context += `Answer: ${data.Answer}\n`;
     if (data.Definition) context += `Definition: ${data.Definition}\n`;
-    if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+    if (data.RelatedTopics?.length > 0) {
       const topics = data.RelatedTopics.slice(0, 3).map(t => t.Text).filter(Boolean).join('\n');
-      if (topics) context += `Related info:\n${topics}\n`;
+      if (topics) context += `Related:\n${topics}\n`;
     }
     return context || '';
-  } catch (e) {
-    console.warn('DuckDuckGo search failed:', e);
-    return '';
-  }
+  } catch(e) { return ''; }
 }
 
 // ============================================================
